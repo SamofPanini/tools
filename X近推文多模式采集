@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         X近推文多模式采集
 // @namespace    local.x.latest3
-// @version      1.1.0
-// @description  手动启动；独立的最新1条/最新3条配置；暗色界面；账号切换；最多5个后台标签页并发；复制Markdown。
+// @version      1.2.0
+// @description  手动启动；1/3/5条独立名单；暗色紧凑界面；按账号只显示新增推文；可调5标签页并发；复制Markdown。
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @run-at       document-start
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
@@ -18,7 +19,7 @@
 (() => {
   'use strict';
 
-  // 可直接修改的显示参数：面板宽度，单位 px。默认 580，建议 500–720。
+  // 显示宽度直接改这里（px）；小屏会自动缩窄。
   const PANEL_WIDTH_PX = 580;
   const MAX_CONCURRENT_TABS = 5;
   const MAX_POSTS_PER_ACCOUNT = 20;
@@ -29,7 +30,8 @@
   const DEFAULT_ACCOUNTS = 'OpenAI\nAnthropicAI\nGoogleDeepMind';
   const MODES = {
     single: {label: '最新 1 条', defaultCount: 1},
-    triple: {label: '最新 3 条', defaultCount: 3}
+    triple: {label: '最新 3 条', defaultCount: 3},
+    quintuple: {label: '最新 5 条', defaultCount: 5}
   };
 
   const pageUrl = new URL(location.href);
@@ -42,29 +44,82 @@
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : fallback;
   };
   const resultKey = (run, username) => `latest3:${run}:${username.toLowerCase()}`;
+  // 每档、每个账号只存一份最新基准；不会积累历史记录。
+  const baselineKey = (mode, username) => `latest3:seen:v1:${mode}:${username.toLowerCase()}`;
+
+  // X status ID 大体按时间单调递增；同秒推文靠 ID 精确区分。
+  function postId(post) {
+    const match = (post?.url || '').match(/\/status\/(\d+)/);
+    return match ? match[1] : (String(post?.id || '').match(/^\d+$/) ? String(post.id) : '');
+  }
+  function compareId(a, b) {
+    if (!a || !b || !/^\d+$/.test(a) || !/^\d+$/.test(b)) return null;
+    try { const x = BigInt(a), y = BigInt(b); return x === y ? 0 : x > y ? 1 : -1; }
+    catch (_) { return null; }
+  }
+  function newerThan(post, reference) {
+    if (!reference) return true;
+    const byId = compareId(postId(post), reference.id);
+    if (byId !== null) return byId > 0;
+    const a = Date.parse(post.date || ''), b = Date.parse(reference.date || '');
+    return Number.isFinite(a) && Number.isFinite(b) && a > b;
+  }
+  function newestFirst(a, b) {
+    const x = compareId(postId(a), postId(b));
+    if (x !== null) return -x;
+    return (Date.parse(b.date || '') || 0) - (Date.parse(a.date || '') || 0);
+  }
+  function validBaseline(value) {
+    return value && typeof value === 'object' &&
+      (/^\d+$/.test(String(value.id || '')) || Number.isFinite(Date.parse(value.date || '')))
+      ? value : null;
+  }
+  function readBaseline(mode, username) {
+    return validBaseline(GM_getValue(baselineKey(mode, username), null));
+  }
+  function summarizeNew(mode, username, raw) {
+    const previous = readBaseline(mode, username);
+    const record = {
+      ...raw, previous, latest: previous,
+      posts: [], firstRun: false, newCount: 0
+    };
+    if (raw?.error || !Array.isArray(raw?.posts) || raw.posts.length === 0) return record;
+    const posts = [...raw.posts].sort(newestFirst);
+    const newest = posts[0];
+    // 未识别出可比对的最新 ID/时间：避免意外清空或污染已有基准。
+    if (!postId(newest) && !Number.isFinite(Date.parse(newest.date || ''))) {
+      record.error = '无法识别最新推文的时间或 ID，本次不更新基准。';
+      return record;
+    }
+    record.firstRun = !previous;
+    record.posts = previous ? posts.filter(post => newerThan(post, previous)) : posts;
+    record.newCount = record.posts.length;
+    if (!previous || newerThan(newest, previous)) {
+      const latest = {id: postId(newest), date: newest.date || '', checkedAt: new Date().toISOString()};
+      GM_setValue(baselineKey(mode, username), latest);
+      record.latest = latest;
+    }
+    return record;
+  }
 
   function readPosts(username, found) {
     const wanted = username.toLowerCase();
     for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
-      // 引用推文中出现的嵌套 article 不计为作者本人发帖。
       if (article.parentElement?.closest('article[data-testid="tweet"]')) continue;
       if (article.querySelector('[data-testid="placementTracking"]')) continue;
-
       const timeEl = article.querySelector('time[datetime]');
       const path = timeEl?.closest('a[href]')?.getAttribute('href') || '';
       const match = path.match(/^\/([A-Za-z0-9_]+)\/status\/(\d+)/);
       if (!match || match[1].toLowerCase() !== wanted) continue;
-
       const context = article.querySelector('[data-testid="socialContext"]')?.innerText || '';
       const intro = (article.innerText || '').slice(0, 155).trim();
       if (/Pinned|置顶|置頂|固定|ピン留め/i.test(context) ||
           /^(Pinned|置顶|置頂|固定|ピン留め)/i.test(intro)) continue;
       if (/(?:Replying to\s+@|回复\s*@|回覆\s*@|返信先\s*[:：]?\s*@)/i.test(intro)) continue;
-
       const tweetText = Array.from(article.querySelectorAll('[data-testid="tweetText"]'))
         .find(el => !el.closest('[data-testid="quoteTweet"]'));
       found.set(match[2], {
-        username: match[1],
+        id: match[2], username: match[1],
         text: tweetText?.innerText?.trim() || '（无正文文本，可能是图片／视频）',
         date: timeEl.getAttribute('datetime'),
         url: `https://x.com/${match[1]}/status/${match[2]}`
@@ -77,17 +132,13 @@
     const start = Date.now();
     while (!document.body && Date.now() - start < WORKER_WAIT_MS) await sleep(250);
     await sleep(1100);
-
     while (Date.now() - start < WORKER_WAIT_MS) {
       readPosts(username, found);
       if (found.size >= count) break;
       window.scrollBy(0, Math.max(650, Math.floor(innerHeight * 0.75)));
       await sleep(1250);
     }
-
-    const posts = [...found.values()]
-      .sort((a, b) => new Date(b.date) - new Date(a.date))
-      .slice(0, count);
+    const posts = [...found.values()].sort(newestFirst).slice(0, count);
     GM_setValue(resultKey(run, username), {
       posts,
       error: posts.length ? '' : '未读到推文：账号可能不可见、需登录，或 X 页面结构已变化。',
@@ -96,7 +147,7 @@
     });
   }
 
-  // 只有含启动标记的账号标签页才运行抓取器；普通 X 页面仅显示面板。
+  // 后台账号标签页只运行抓取；普通 X 页面不会自行抓取。
   if (launchRun && profile) {
     const count = clampInt(pageUrl.searchParams.get(COUNT_PARAM), 1, MAX_POSTS_PER_ACCOUNT, 3);
     runWorker(profile[1], launchRun, count).catch(err => {
@@ -107,12 +158,21 @@
 
   function toMarkdown(username, record) {
     const lines = [`## @${username}`];
-    if (record?.error) lines.push(`抓取失败：${record.error}`);
-    if (record?.incomplete) lines.push('提示：本次读取数量少于目标值，可能受加载、权限或过滤影响。');
-    for (const [index, p] of (record?.posts || []).entries()) {
+    if (!record) return lines.join('\n');
+    if (record.error) lines.push(`抓取失败：${record.error}`);
+    if (!record.error) {
+      lines.push(`新增：${record.newCount || 0} 条`);
+      if (record.firstRun) lines.push('首次采集：已建立最新推文基准。');
+      if (record.incomplete) lines.push('提示：读取数量少于目标值，可能受加载、权限或过滤影响。');
+      if (record.previous?.date) lines.push(`上次最新：${record.previous.date}`);
+      if (!record.posts?.length) {
+        lines.push(`无更新${record.latest?.date ? `（最新记录：${record.latest.date}）` : ''}`);
+      }
+    }
+    for (const [index, p] of (record.posts || []).entries()) {
       lines.push(`\n${index + 1}. ${p.date || '时间未知'}\n\n${p.text}\n\n${p.url}`);
     }
-    if (!record?.posts?.length && !record?.error) lines.push('没有符合条件的推文');
+    if (record.error && record.previous?.date) lines.push(`保存的上次最新：${record.previous.date}`);
     return lines.join('\n');
   }
 
@@ -137,66 +197,67 @@
         button:hover:not(:disabled){background:#293440}
         button:disabled{opacity:.5;cursor:default}
         .toggle{background:#172c3c;color:#fff;border:1px solid #365c77;box-shadow:0 4px 16px #0008;font-weight:700}
-        .panel{display:none;width:min(var(--panel-width),calc(100vw - 24px));max-height:82vh;max-height:82dvh;overflow-y:auto;margin-bottom:9px;background:#10171d;border:1px solid #35414a;border-radius:12px;box-shadow:0 8px 30px #0009;padding:16px;color:#e7e9ea;color-scheme:dark}
+        .panel{display:none;width:min(var(--panel-width),calc(100vw - 24px));max-height:82dvh;overflow-y:auto;margin-bottom:9px;background:#10171d;border:1px solid #35414a;border-radius:12px;box-shadow:0 8px 30px #0009;padding:14px;color:#e7e9ea;color-scheme:dark}
         .panel.open{display:block}
-        .heading{font-size:15px;font-weight:750;margin-bottom:10px}
-        .mode-tabs,.account-tabs,.actions,.settings{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-        .mode-tabs{margin:0 0 14px}
-        .mode-tabs button{flex:1;min-width:120px}
+        .heading{font-size:15px;font-weight:750;margin-bottom:9px}
+        .mode-tabs,.account-tabs,.actions,.settings{display:flex;gap:7px;align-items:center}
+        .mode-tabs{margin:0 0 10px}
+        .mode-tabs button{flex:1;min-width:0;padding:7px 5px}
         button.selected{color:#fff;background:#164b72;border-color:#4099d3}
         .mode-pane{display:none}
         .mode-pane.selected{display:block}
-        label{display:block;font-weight:650;margin:8px 0 5px}
-        textarea,input{border:1px solid #3a4650;border-radius:8px;padding:8px 10px;background:#17212a;color:#e7e9ea;outline:none}
+        label{display:block;font-weight:650;margin:6px 0 4px}
+        textarea,input{border:1px solid #3a4650;border-radius:8px;padding:7px 9px;background:#17212a;color:#e7e9ea;outline:none}
         textarea:focus,input:focus{border-color:#62ace0}
-        textarea{width:100%;resize:vertical;min-height:76px}
-        input[type=number]{width:76px}
-        .settings{margin-top:10px}
-        .settings label{margin:0;font-weight:500}
-        .setting{display:flex;gap:7px;align-items:center}
-        .hint{color:#9aaab8;font-size:12px;line-height:1.6;margin:9px 0}
-        .actions{margin:13px 0}
+        textarea{width:100%;resize:vertical;min-height:74px}
+        input[type=number]{width:65px;min-width:0}
+        .settings{margin-top:9px;flex-wrap:nowrap;gap:16px}
+        .settings label{margin:0;font-weight:500;white-space:nowrap}
+        .setting{display:flex;gap:6px;align-items:center;min-width:0}
+        .hint{color:#9aaab8;font-size:12px;line-height:1.5;margin:8px 0}
+        .actions{margin:10px 0;flex-wrap:wrap}
         .primary{background:#1b719f;color:#fff;border-color:#369acd;font-weight:700}
         .primary:hover:not(:disabled){background:#2285b9}
-        .status{white-space:pre-wrap;font-size:12px;color:#b0c1cd;margin:8px 0;max-height:96px;overflow:auto}
-        .results{border-top:1px solid #35414a;padding-top:12px;margin-top:12px}
-        .result-label{font-weight:700;margin-bottom:8px}
-        .account-tabs{margin:0 0 9px;max-height:106px;overflow:auto}
-        .account-tabs button{font-size:12px;padding:5px 9px}
-        .output{min-height:155px;height:195px;white-space:pre-wrap}
+        .status{font-size:12px;color:#b0c1cd;margin:7px 0 5px;line-height:1.5}
+        .account-tabs{margin:0 0 7px;max-height:115px;overflow:auto;flex-wrap:wrap}
+        .account-tabs button{font-size:12px;padding:4px 8px}
+        .output{min-height:140px;height:190px;white-space:pre-wrap}
         .empty{color:#8e9ca7;font-size:12px;margin:8px 0}
-        @media(max-width:500px){.panel{padding:12px}.settings{align-items:flex-start}.setting{width:100%;justify-content:space-between}}
+        @media(max-width:440px){.panel{padding:11px}.settings{gap:8px}.setting{gap:4px}.setting label{font-size:12px}.setting input{width:49px}.mode-tabs button{font-size:12px}.actions button{padding:6px 8px}}
       </style>
       <div class="panel" id="panel">
         <div class="heading">X 指定账号 · 最近推文</div>
         <div class="mode-tabs">
-          <button id="tab-single" class="selected" type="button">① 最新 1 条</button>
-          <button id="tab-triple" type="button">② 最新 3 条</button>
+          <button id="tab-single" class="selected" type="button">最新 1 条</button>
+          <button id="tab-triple" type="button">最新 3 条</button>
+          <button id="tab-quintuple" type="button">最新 5 条</button>
         </div>
         <section class="mode-pane selected" id="pane-single">
-          <label for="accounts-single">组 ① · 账号列表（每行一个，无需 @）</label>
+          <label for="accounts-single">账号列表（每行一个，无需 @）</label>
           <textarea id="accounts-single" rows="4" spellcheck="false"></textarea>
-          <div class="settings"><div class="setting"><label for="count-single">每账号抓取</label><input id="count-single" type="number" min="1" max="20" step="1"><span>条</span></div></div>
         </section>
         <section class="mode-pane" id="pane-triple">
-          <label for="accounts-triple">组 ② · 账号列表（每行一个，无需 @）</label>
+          <label for="accounts-triple">账号列表（每行一个，无需 @）</label>
           <textarea id="accounts-triple" rows="4" spellcheck="false"></textarea>
-          <div class="settings"><div class="setting"><label for="count-triple">每账号抓取</label><input id="count-triple" type="number" min="1" max="20" step="1"><span>条</span></div></div>
         </section>
-        <div class="settings"><div class="setting"><label for="concurrency">后台并发标签页</label><input id="concurrency" type="number" min="1" max="5" step="1"><span>个（上限 5）</span></div></div>
-        <div class="hint">两组名单与抓取数量分别保存；点击启动后才会打开账号标签页。默认过滤置顶、转推和可识别的回复。</div>
+        <section class="mode-pane" id="pane-quintuple">
+          <label for="accounts-quintuple">账号列表（每行一个，无需 @）</label>
+          <textarea id="accounts-quintuple" rows="4" spellcheck="false"></textarea>
+        </section>
+        <div class="settings">
+          <div class="setting"><label for="count">每账号</label><input id="count" type="number" min="1" max="20" step="1"><span>条</span></div>
+          <div class="setting"><label for="concurrency">后台并发</label><input id="concurrency" type="number" min="1" max="5" step="1"><span>页</span></div>
+        </div>
+        <div class="hint">默认过滤置顶、转推及可识别的回复。</div>
         <div class="actions">
-          <button id="start" class="primary" type="button">▶ 启动抓取当前组</button>
+          <button id="start" class="primary" type="button">▶ 启动抓取</button>
           <button id="copy-current" type="button" disabled>复制当前账号</button>
-          <button id="copy-all" type="button" disabled>复制本组全部</button>
+          <button id="copy-all" type="button" disabled>复制本组新增</button>
         </div>
         <div class="status" id="status" role="status">尚未开始抓取。</div>
-        <div class="results">
-          <div class="result-label">结果 · 点击账号名切换</div>
-          <div class="account-tabs" id="account-tabs"></div>
-          <div class="empty" id="empty">点击“启动抓取当前组”后显示结果。</div>
-          <textarea id="output" class="output" rows="9" readonly placeholder="当前账号的推文会显示在这里"></textarea>
-        </div>
+        <div class="account-tabs" id="account-tabs"></div>
+        <div class="empty" id="empty">抓取后点击账号名查看新增推文。</div>
+        <textarea id="output" class="output" rows="9" readonly placeholder="这里仅显示所选账号的新增推文"></textarea>
       </div>
       <button class="toggle" id="toggle" type="button">X 推文采集</button>`;
     document.body.appendChild(host);
@@ -204,25 +265,25 @@
     const $ = id => shadow.getElementById(id);
     let activeMode = 'single';
     let isRunning = false;
-    const sessions = {
-      single: {usernames: [], data: new Map(), selected: null, status: '尚未开始抓取。'},
-      triple: {usernames: [], data: new Map(), selected: null, status: '尚未开始抓取。'}
-    };
-
+    const sessions = Object.fromEntries(Object.keys(MODES).map(id => [id, {
+      usernames: [], data: new Map(), selected: null, done: 0,
+      status: '尚未开始抓取。', lastCount: MODES[id].defaultCount
+    }]));
+    const modeCounts = {};
     const inheritedAccounts = GM_getValue('latest3:accounts', DEFAULT_ACCOUNTS);
     for (const [id, mode] of Object.entries(MODES)) {
       $(`accounts-${id}`).value = GM_getValue(`latest3:accounts:${id}`, inheritedAccounts);
-      $(`count-${id}`).value = clampInt(GM_getValue(`latest3:count:${id}`, mode.defaultCount), 1, MAX_POSTS_PER_ACCOUNT, mode.defaultCount);
-      $(`accounts-${id}`).addEventListener('change', () => {
-        GM_setValue(`latest3:accounts:${id}`, $(`accounts-${id}`).value);
-      });
-      $(`count-${id}`).addEventListener('change', () => {
-        const value = clampInt($(`count-${id}`).value, 1, MAX_POSTS_PER_ACCOUNT, mode.defaultCount);
-        $(`count-${id}`).value = value;
-        GM_setValue(`latest3:count:${id}`, value);
-      });
+      modeCounts[id] = clampInt(GM_getValue(`latest3:count:${id}`, mode.defaultCount), 1, MAX_POSTS_PER_ACCOUNT, mode.defaultCount);
+      $(`accounts-${id}`).addEventListener('change', () => GM_setValue(`latest3:accounts:${id}`, $(`accounts-${id}`).value));
       $(`tab-${id}`).onclick = () => setMode(id);
     }
+    $('count').value = modeCounts[activeMode];
+    $('count').addEventListener('change', () => {
+      const value = clampInt($('count').value, 1, MAX_POSTS_PER_ACCOUNT, MODES[activeMode].defaultCount);
+      $('count').value = value;
+      modeCounts[activeMode] = value;
+      GM_setValue(`latest3:count:${activeMode}`, value);
+    });
     $('concurrency').value = clampInt(GM_getValue('latest3:concurrency', 2), 1, MAX_CONCURRENT_TABS, 2);
     $('concurrency').addEventListener('change', () => {
       const value = clampInt($('concurrency').value, 1, MAX_CONCURRENT_TABS, 2);
@@ -232,10 +293,9 @@
     $('toggle').onclick = () => $('panel').classList.toggle('open');
 
     function buildAllMarkdown(session) {
-      return `# X 最近推文采集\n\n${session.usernames.filter(u => session.data.has(u))
+      return `# X 最近推文 · 增量采集\n\n${session.usernames.filter(u => session.data.has(u))
         .map(u => toMarkdown(u, session.data.get(u))).join('\n\n---\n\n')}`;
     }
-
     function render() {
       const session = sessions[activeMode];
       $('status').textContent = session.status;
@@ -246,7 +306,7 @@
         const record = session.data.get(username);
         const button = document.createElement('button');
         button.type = 'button';
-        button.textContent = `@${username} (${record.posts?.length || 0})`;
+        button.textContent = `@${username} · ${record.error ? '失败' : `${record.newCount || 0}`}`;
         if (username === session.selected) button.classList.add('selected');
         button.onclick = () => { session.selected = username; render(); };
         tabs.appendChild(button);
@@ -254,14 +314,18 @@
       const current = session.selected && session.data.get(session.selected);
       $('output').value = current ? toMarkdown(session.selected, current) : '';
       $('empty').style.display = current ? 'none' : 'block';
-      $('empty').textContent = session.usernames.length ? '等待账号抓取结果…' : '点击“启动抓取当前组”后显示结果。';
+      $('empty').textContent = session.usernames.length ? '抓取中，等待账号结果…' : '抓取后点击账号名查看新增推文。';
       $('copy-current').disabled = !current;
       $('copy-all').disabled = session.data.size === 0;
       $('start').disabled = isRunning;
     }
-
     function setMode(modeId) {
+      // 切换页签时保存上一组尚未失焦的数字和文本。
+      modeCounts[activeMode] = clampInt($('count').value, 1, MAX_POSTS_PER_ACCOUNT, MODES[activeMode].defaultCount);
+      GM_setValue(`latest3:count:${activeMode}`, modeCounts[activeMode]);
+      GM_setValue(`latest3:accounts:${activeMode}`, $(`accounts-${activeMode}`).value);
       activeMode = modeId;
+      $('count').value = modeCounts[modeId];
       for (const id of Object.keys(MODES)) {
         $(`tab-${id}`).classList.toggle('selected', id === modeId);
         $(`pane-${id}`).classList.toggle('selected', id === modeId);
@@ -271,20 +335,19 @@
 
     function fetchAccount(username, run, count) {
       return new Promise(resolve => {
-        let finished = false;
-        let tab;
-        let timeoutId;
-        let listenerId;
+        let finished = false, tab, timeoutId, listenerId;
         const key = resultKey(run, username);
         function finish(data) {
           if (finished) return;
           finished = true;
           clearTimeout(timeoutId);
           if (listenerId !== undefined) GM_removeValueChangeListener(listenerId);
-          try { tab?.close(); } catch (_) { /* 标签页关闭失败不影响结果 */ }
+          try { tab?.close(); } catch (_) { /* 关闭失败不影响数据 */ }
+          // 每次运行临时回传的数据即用即删，不累积在 Tampermonkey 的存储中。
+          try { GM_deleteValue(key); } catch (_) { /* 不影响抓取 */ }
           resolve(data);
         }
-        listenerId = GM_addValueChangeListener(key, (_k, _old, value) => {
+        listenerId = GM_addValueChangeListener(key, (_key, _old, value) => {
           if (value && typeof value === 'object') finish(value);
         });
         timeoutId = setTimeout(() => finish({posts: [], error: `超过 ${Math.round(TAB_TIMEOUT_MS / 1000)} 秒：标签页可能被限速或未加载。`}), TAB_TIMEOUT_MS);
@@ -293,9 +356,7 @@
           url.searchParams.set(RUN_PARAM, run);
           url.searchParams.set(COUNT_PARAM, String(count));
           tab = GM_openInTab(url.toString(), {active: false, insert: true, setParent: true});
-        } catch (err) {
-          finish({posts: [], error: `打开账号页失败：${err}`});
-        }
+        } catch (err) { finish({posts: [], error: `打开账号页失败：${err}`}); }
       });
     }
 
@@ -307,13 +368,13 @@
       const usernames = parseAccounts(accountBox.value);
       if (!usernames.length) {
         sessions[modeId].status = '请输入有效的账号名（例如 OpenAI），每行一个，最多 20 个。';
-        render();
-        return;
+        render(); return;
       }
-      const count = clampInt($(`count-${modeId}`).value, 1, MAX_POSTS_PER_ACCOUNT, mode.defaultCount);
+      const count = clampInt($('count').value, 1, MAX_POSTS_PER_ACCOUNT, mode.defaultCount);
       const concurrency = clampInt($('concurrency').value, 1, MAX_CONCURRENT_TABS, 2);
-      $(`count-${modeId}`).value = count;
+      $('count').value = count;
       $('concurrency').value = concurrency;
+      modeCounts[modeId] = count;
       GM_setValue(`latest3:accounts:${modeId}`, accountBox.value);
       GM_setValue(`latest3:count:${modeId}`, count);
       GM_setValue('latest3:concurrency', concurrency);
@@ -322,33 +383,33 @@
       session.usernames = usernames;
       session.data = new Map();
       session.selected = null;
-      session.status = `准备抓取 ${usernames.length} 个账号，每个最多 ${count} 条，并发 ${concurrency} 个标签页…`;
+      session.done = 0;
+      session.lastCount = count;
+      session.status = `已完成 0/${usernames.length} · 新增 0 · ${mode.label}`;
       isRunning = true;
       render();
-
       const run = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       let cursor = 0;
       async function work() {
         while (cursor < usernames.length) {
           const username = usernames[cursor++];
-          let data;
-          try {
-            data = await fetchAccount(username, run, count);
-          } catch (err) {
-            data = {posts: [], error: String(err)};
-          }
-          session.data.set(username, data);
+          let raw;
+          try { raw = await fetchAccount(username, run, count); }
+          catch (err) { raw = {posts: [], error: String(err)}; }
+          let record;
+          try { record = summarizeNew(modeId, username, raw); }
+          catch (err) { record = {posts: [], error: `保存基准失败：${err}`, newCount: 0, previous: readBaseline(modeId, username)}; }
+          session.data.set(username, record);
+          session.done += 1;
           if (!session.selected) session.selected = username;
-          const summary = usernames.filter(u => session.data.has(u))
-            .map(u => `@${u}: ${session.data.get(u).posts?.length || 0} 条${session.data.get(u).error ? '（失败）' : session.data.get(u).incomplete ? '（不足目标）' : ''}`)
-            .join('\n');
-          session.status = `已完成 ${session.data.size}/${usernames.length} · ${MODES[modeId].label}\n${summary}`;
+          const totalNew = [...session.data.values()].reduce((n, d) => n + (d.newCount || 0), 0);
+          const errors = [...session.data.values()].filter(d => d.error).length;
+          session.status = `已完成 ${session.done}/${usernames.length} · 新增 ${totalNew} 条${errors ? ` · 失败 ${errors}` : ''} · ${mode.label}`;
           if (activeMode === modeId) render();
         }
       }
       try {
         await Promise.all(Array.from({length: Math.min(concurrency, usernames.length)}, () => work()));
-        session.status += '\n本组抓取结束。';
       } finally {
         isRunning = false;
         render();
@@ -359,14 +420,14 @@
       const session = sessions[activeMode];
       if (!session.selected || !session.data.has(session.selected)) return;
       GM_setClipboard(toMarkdown(session.selected, session.data.get(session.selected)), 'text');
-      session.status += '\n当前账号 Markdown 已复制。';
+      session.status += ' · 已复制当前';
       render();
     };
     $('copy-all').onclick = () => {
       const session = sessions[activeMode];
       if (!session.data.size) return;
       GM_setClipboard(buildAllMarkdown(session), 'text');
-      session.status += '\n本组全部 Markdown 已复制。';
+      session.status += ' · 已复制本组';
       render();
     };
     render();
