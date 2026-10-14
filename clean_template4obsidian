@@ -1,0 +1,730 @@
+<%*
+const file = app.workspace.getActiveFile();
+let content = await app.vault.read(file);
+
+const cache = app.metadataCache.getFileCache(file);
+const fm = cache?.frontmatter ?? {};
+
+const link = fm.link ?? "";
+const title = fm.title ?? "";
+
+// =====================================================
+// 分离 Frontmatter
+// =====================================================
+
+let frontmatter = "";
+let body = content;
+
+const fmMatch = content.match(
+    /^---\n[\s\S]*?\n---\n?/u
+);
+
+if (fmMatch) {
+    frontmatter = fmMatch[0];
+    body = content.slice(frontmatter.length);
+}
+
+// =====================================================
+// Perplexity
+// =====================================================
+
+if (link.includes("https://www.perplexity.ai/")) {
+
+    body = body.normalize("NFKC");
+
+    // 删除「◯件のソース」
+    body = body.replace(
+        /^[^\n\r]*件\s*の\s*ソース[^\n\r]*[\r\n]*/gmu,
+        ""
+    );
+
+    // 删除「公開済み」或「公開された」区块
+    // 改进逻辑：
+    // 1. 先查找“公開済み”或“公開された”附近是否有日期，如果有则暂存。
+    // 2. 删除从“公開済み/公開された”开始到下一个“## ”标题之前的所有内容。
+    
+    let dateToKeep = "";
+    
+    // 尝试提取日期 (假设日期在关键词后的100个字符内)
+    const preCheck = body.match(/(公開済み|公開された)[\s\S]{0,200}?(\d{4}年\d{1,2}月\d{1,2}日)/u);
+    if (preCheck) {
+        dateToKeep = preCheck[2];
+    }
+
+    // 执行删除：从关键词开始，非贪婪匹配直到遇到下一个 ## 标题
+    // 注意：这里使用 [\s\S]*? 确保跨行匹配，直到找到 ^## 
+    body = body.replace(
+        /(公開済み|公開された)[\s\S]*?(?=^##\s)/mu,
+        ""
+    );
+
+    // 如果之前提取到了日期，将其插入到当前正文的开头（或适当位置）
+    // 注意：由于我们删除了大块内容，可能需要根据具体需求调整日期插入位置
+    // 这里假设希望日期保留在原来大致的位置，但由于大块删除，通常放在剩余内容的顶部或原位置
+    // 更简单的做法：如果删除成功且有日期，手动拼接到剩余内容前，或者在replace回调中处理
+    
+    // 【更优方案】：直接在 replace 回调中处理，避免二次拼接错误
+    body = body.replace(
+        /(公開済み|公開された)([\s\S]*?)(?=^##\s)/mu,
+        (match, keyword, contentBetween) => {
+            // 在删除的内容块中查找日期
+            const dateMatch = contentBetween.match(/\d{4}年\d{1,2}月\d{1,2}日/u);
+            if (dateMatch) {
+                // 保留日期，并添加换行，然后返回空字符串表示删除了其他部分
+                // 注意： lookahead (?=^##) 不会消耗 ## 标题，所以 ## 标题会保留
+                return `${dateMatch[0]}\n\n`;
+            }
+            // 如果没有日期，直接删除整个块（返回空字符串）
+            return "";
+        }
+    );
+
+    // 删除「もっと見る」或「もっと知る」及以下全部
+    body = body.replace(
+        /(もっと見る|もっと知る)[\s\S]*/m,
+        ""
+    );
+}
+
+// =====================================================
+// Forbes JAPAN
+// =====================================================
+
+if (link.includes("https://forbesjapan.com/")) {
+
+    // title 清洗
+    if (fm.title) {
+        const newTitle = fm.title.replace(
+            /\s*\|\s*Forbes JAPAN 公式サイト（フォーブス ジャパン）$/u,
+            ""
+        );
+        await app.fileManager.processFrontMatter(
+            file,
+            fm => {
+                fm.title = newTitle;
+            }
+        );
+    }
+    // 清除标注页数的内容 (如: [PAGE 2](https://forbesjapan.com/articles/detail/99240/page2))
+    body = body.replace(/^\s*\[PAGE [1-9]\]\([^)]+\)\s*\n?/gm, "");
+    body = body.replace(/.*次ページ.*\r?\n?/gu,"");
+    body = body.replace(/Measure[\s\S]*$/u,"");
+    body = body.replace(
+    /^[ \t]*\* \* \*[ \t]*\r?\n[ \t]*\r?\n[ \t]*page:[ \t]*\[\d+\]\(https?:\/\/[^)\r\n]+\)[ \t]*(?:\r?\n|$)/gmu,
+    "");
+    // 优先保留署名行
+    const creditMatch = body.match(
+        /((?:文|写真|編集|翻訳).*＝[^\r\n]*)/u
+    );
+    if (creditMatch) {
+        const pos =
+            body.indexOf(creditMatch[0]) +
+            creditMatch[0].length;
+        body = body.slice(0, pos);
+    } else {
+        // 没有署名时保留 forbes.com 原文行
+        const sourceMatch = body.match(
+            /（\s*\[forbes\.com\s*原文\]\([^)]+\)\s*）/u
+        );
+        if (sourceMatch) {
+            const pos =
+                body.indexOf(sourceMatch[0]) +
+                sourceMatch[0].length;
+            body = body.slice(0, pos);
+        }
+    }
+}
+
+// =====================================================
+//ITmedia
+// =====================================================
+
+if (link.includes("https://www.itmedia.co.jp/") || link.includes("http://www.itmedia.co.jp/")) {
+
+    // 清除「Special PR」区块及其后所有内容
+    body = body.replace(
+        /\nSpecial\s*\n\s*PR[\s\S]*$/u,
+        ""
+    );
+		// 清除标注页数的内容，并级联清除其上方的两行
+		body = body.replace(/([^\r\n]*[\r\n]+){2}\s*\[PAGE [1-9]\]\([^)]+\)\s*[\r\n]*/g, "");
+    // 清除「PAGE 数字」所在行及之前两行的内容
+    // 逻辑：匹配 [非换行符]{0,} + 换行 + [非换行符]{0,} + 换行 + [包含 PAGE 数字的行]
+    body = body.replace(
+        /[^\r\n]*\r?\n[^\r\n]*\r?\n[^\r\n]*PAGE\s+\d+[^\r\n]*\r?\n?/u,
+        ""
+    );
+    // 清除Copy及其后所有内容
+    body = body.replace(
+        /Copyright[\s\S]*$/u,
+        ""
+    );
+			body = body.replace(
+			/### 関連記事[\s\S]*$/u,
+			""
+    );
+    
+}
+
+
+// =====================================================
+// ニッセイ
+// =====================================================
+
+if (link.includes("https://www.nli-research.co.jp")) {
+
+    // 清除【次ページ】はじめに
+    body = body.replace(
+        /【次ページ】はじめに[\s\S]*$/u,
+        ""
+    );
+		// 清除第二个 このレポートの関連カテゴリ
+		const marker = "このレポートの関連カテゴリ";
+		
+		const firstIndex = body.indexOf(marker);
+		
+		if (firstIndex !== -1) {
+		    const secondIndex = body.indexOf(
+		        marker,
+		        firstIndex + marker.length
+		    );
+		
+		    if (secondIndex !== -1) {
+		        body = body.slice(0, secondIndex);
+		    }
+		};
+		// 清除到はじめに 为止
+		body = body.replace(
+		    /^[\s\S]*?(?=^(?:###\s+はじめに|■要旨)\s*$)/mu,
+		    ""
+		);
+}
+
+
+// =====================================================
+// TechCrunch
+// =====================================================
+
+if (link.includes("http://jp.techcrunch.com/")) {
+    // 清除【次ページ】はじめに
+    body = body.replace(
+        /^.*次の記事.*(?:\r?\n|$)/gmu,
+        ""
+    );
+    body = body.replace(
+        /TechCrunch Japanの最新記事を購読しよう[\s\S]*$/u,
+        ""
+    );
+}
+
+
+// =====================================================
+// Nikkei
+// =====================================================
+
+if (link.includes("https://www.nikkei.com/")) {
+
+    body = body.replace(
+        /【関連記事】[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// Nikkei Business
+// =====================================================
+
+if (link.includes("https://business.nikkei.com/")) {
+
+    // ---- 规则1：删除首个指定图片行至「この記事の3つのポイント」之前 ----
+    const lines = body.split(/\r?\n/);
+
+    const firstImageLine = lines.findIndex(line =>
+        line.includes("cdn-business.nikkei.com")
+    );
+    if (firstImageLine !== -1) {
+        const pointLine = lines.findIndex((line, idx) =>
+            idx > firstImageLine &&
+            line.trim() === "#### この記事の3つのポイント"
+        );
+        if (pointLine !== -1) {
+            lines.splice(firstImageLine, pointLine - firstImageLine);
+        } else {
+            lines.splice(firstImageLine, 1);
+        }
+        body = lines.join("\n");
+    }
+    // ---- 规则2：删除图片放大提示 ----
+    body = body.replace(
+        /\\?\[画像のクリックで拡大表示\\?\]/gu,
+        ""
+    );
+    // ---- 规则3：删除评论数量所在行 ----
+    body = body.replace(
+        /^.*件のコメント.*(?:\r?\n|$)/gmu,
+        ""
+    );
+    // ---- 规则4：统一正文截断 ----
+    const endMarkers = [
+        {
+            text: "に収容されています。",
+            keep: true
+        },
+        {
+            text: "有料会員は、以下リンク",
+            keep: false
+        },
+        {
+            text: "有料契約者は、以下リンク",
+            keep: false
+        },
+        {
+            text: "- 記事を贈る",
+            keep: false
+        },
+        {
+            text: "©The Financial Times Limited",
+            keep: false
+        },
+        {
+            text: "シリーズをフォロー",
+            keep: false
+        },
+        {
+            text: "この記事はシリーズ",
+            keep: false,
+            fallbackOnly: true
+        }
+    ];
+    // 优先使用正式截断条件
+    const primaryMatches = endMarkers
+        .filter(item => !item.fallbackOnly)
+        .map(item => ({
+            ...item,
+            index: body.indexOf(item.text)
+        }))
+        .filter(item => item.index !== -1);
+    let selected = null;
+    if (primaryMatches.length > 0) {
+        selected = primaryMatches.reduce((a, b) =>
+            a.index <= b.index ? a : b
+        );
+    } else {
+        // 仅在没有其他截断标记时，使用旧规则兜底
+        const fallback = endMarkers.find(item => item.fallbackOnly);
+        const index = body.indexOf(fallback.text);
+        if (index !== -1) {
+            selected = { ...fallback, index };
+        }
+    }
+    if (selected) {
+        const cutPosition = selected.keep
+            ? selected.index + selected.text.length
+            : selected.index;
+        body = body.slice(0, cutPosition);
+    }
+    body = body.trim();
+}
+
+// =====================================================
+// Nikkei Trend
+// =====================================================
+
+if (link.includes("https://xtrend.nikkei.com/")) {
+
+    // 清除“Related”及其后所有内容
+    body = body.replace(
+        /## この特集・連載の目次[\s\S]*$/u,
+        ""
+    );
+    // 清除“[”该行
+    body = body.replace(
+        /^[ \t]*\[続き：[^\r\n]*(?:\r?\n|$)/gmu,
+        ""
+    );
+}
+
+
+// =====================================================
+// Wired.jp
+// =====================================================
+
+if (link.includes("https://wired.jp/")) {
+
+    // 清除“Related”及其后所有内容
+    body = body.replace(
+        /Related Articles[\s\S]*$/u,
+        ""
+    );
+	  // 清除“关联”及其后所有内容
+    body = body.replace(
+        /※『WIRED』による[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// Bridge
+// =====================================================
+
+if (link.includes("http://thebridge.jp") || link.includes("https://thebridge.jp")) {
+    // 清除“Related”及其后所有内容
+    body = body.replace(
+        /### ニュースレターの購読について[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// Digiday
+// =====================================================
+
+if (link.includes("https://digiday.jp/"))  {
+    // 清除“Related”及其后所有内容
+    body = body.replace(
+        /Measure[\s\S]*$/u,
+        ""
+    );
+        body = body.replace(
+        /.*Advertisement.*\r?\n?/gu,
+        ""
+    );
+				body = body.replace(
+				/^.*Turn on tldr.*(?:\r?\n[^\r\n]*(?:\r?\n|$)|$)/gmu,
+				""
+    );
+}
+
+// =====================================================
+// TechTarget
+// =====================================================
+
+if (link.includes("https://techtarget.itmedia.co.jp"))  {
+    // 清除“Related”及其后所有内容
+    body = body.replace(
+        /^#{1,3}[ \t]+TechTarget発[\s\S]*$/mu,
+        ""
+    );
+    // 仅清除推荐文章区块，不影响后续正文
+    body = body.replace(/(?:^|\r?\n)(?:---[ \t]*\r?\n[ \t]*)?### 併せて読みたいお薦め記事[ \t]*(?:\r?\n[ \t]*(?:####[^\r\n]*|-[^\r\n]*\]\(https?:\/\/[^\r\n]*|))*/g,"\n");
+    body = body.replace(/- PR -[\s\S]*$/u,"");
+}
+
+// =====================================================
+// Nikkei BP
+// =====================================================
+
+if (link.includes("https://tech.nikkeibp.co.jp") || link.includes("http://tech.nikkeibp.co.jp/")) {
+    body = body.replace(
+        /Measure[\s\S]*$/u,
+        ""
+    );
+    body = body.replace(
+        /### この先は有料会員の登録が必要[\s\S]*$/u,
+        "..."
+    );
+}
+
+
+// =====================================================
+// MIT Review
+// =====================================================
+
+if (link.includes("https://www.technologyreview.jp/")) {
+    body = body.replace(
+        /人気の記事ランキング[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// PRESIDENT、JB、Wedge
+// =====================================================
+
+if (link.includes("https://president.jp/") || link.includes("https://diamond.jp/") || link.includes("https://wedge.ismedia.jp/") || link.includes("http://wedge.ismedia.jp/") || link.includes("https://jbpress.ismedia.jp/")) {
+
+    // 清除标注页数的内容 (如: [PAGE 2](url) 或 [PAGE 12](url))
+    // 注意：此规则假设 president.jp 与 ismedia.jp 系的分页标记格式完全同构。
+    // 若 president.jp 实际运行中出现漏洗，需验证其 DOM 结构并为其单独剥离正则。
+    body = body.replace(/^\s*\[PAGE \d+\]\([^)]+\)\s*\n?/gm, "");
+    body = body.replace(/^[ \t]*\[ページ分割[^\r\n]*(?:\r?\n|$)/gmu, "");
+    // 删页数 
+    body = body.replace(/^[ \t]*\* \* \*[ \t]*\r?\n[ \t]*\r?\n[ \t]*page:[ \t]*\[\d+\]\(https?:\/\/[^)\r\n]+\)[ \t]*(?:\r?\n|$)/gmu, "");
+    body = body.replace(/^[ \t]*\[次ページ[^\]\r\n]*\]\(http?:\/\/[^)\r\n]+\)[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\* \* \*[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*page:[ \t]*\[\d+\]\(http?:\/\/[^)\r\n]+\)[ \t]*(?:\r?\n|$)/gmu, "");
+    body = body.replace(
+        /Measure[\s\S]*$/gmu,
+        ""
+    );
+    body = body.replace(
+        /検索時に関連する記事が表示されます[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// Newspicks、President
+// =====================================================
+
+if (link.includes("https://newspicks.com/") || link.includes("https://president.jp/")) {
+
+    body = body.replace(
+        /【関連記事】[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// 163.com (NetEase)
+// =====================================================
+
+if (link.includes("https://www.163.com/") || link.includes("https://c.m.163.com/")) {
+
+    // 清除“特别声明”及其后所有内容
+    body = body.replace(
+        /特别声明[\s\S]*$/u,
+        ""
+    );
+		// 清除“打开网易新闻”所在行及下一行
+    body = body.replace(
+        /.*打开网易新闻.*\r?\n?/gu,
+        ""
+    );
+    // 清除“分享至”所在行及之前两行的内容
+    body = body.replace(
+        /[^\r\n]*\r?\n[^\r\n]*\r?\n[^\r\n]*分享至[^\r\n]*\r?\n?/u,
+        ""
+    );
+}
+
+// =====================================================
+// Jiefang Daily (jfdaily.com)
+// =====================================================
+
+if (link.includes("https://www.jfdaily.com/")) {
+
+    // 1. 保留第一行，清除从“以上内容由AI生成”所在行开始到第一行之后的所有内容
+    // 逻辑：匹配 (第一行) + (中间任意内容直到"以上内容由AI生成"所在行)，替换为仅保留第一行
+    body = body.replace(
+        /^([^\r\n]*\r?\n)[\s\S]*?^.*以上内容由AI生成.*$/mu,
+        "$1"
+    );
+    // 2. 清除“未经正式授权”所在行及之后的所有内容
+    body = body.replace(
+        /.*未经正式授权.*[\s\S]*$/u,
+        ""
+    );
+}
+
+// =====================================================
+// X (UF_dynasty)
+// =====================================================
+
+if (link.includes("https://x.com/UF_dynasty/status")) {
+
+    // 先统一换行
+    body = body.replace(/\r\n/g, "\n");
+    // 编号标题去数字
+    // 神の子１ → 神の子
+    // フランツ２ → フランツ
+    body = body.replace(
+        /^([^\d\s]{2,30})[0-9０-９]+$/gmu,
+        "$1"
+    );
+    // 按 --- 分块
+    const blocks = body.split(
+        /^---\s*$/gm
+    );
+    let firstSpeakerSeen = false;
+    body = blocks
+        .map(block => {
+            block = block.trim();
+            if (!block) return "";
+            let lines = block.split("\n");
+            // 去掉 block 开头和结尾空行
+            lines = lines.filter(
+                line => line.trim() !== ""
+            );
+            if (lines.length === 0) return "";
+            const firstLine = lines[0].trim();
+            // 第一行是角色名
+            if (
+                /^[^\d\s]{2,30}$/u.test(firstLine)
+            ) {
+                if (!firstSpeakerSeen) {
+                    firstSpeakerSeen = true;
+                } else {
+                    // 后续重复角色名删除
+                    lines.shift();
+                }
+            }
+            // block 内部空行全部去掉
+            return lines
+                .filter(
+                    line => line.trim() !== ""
+                )
+                .join("\n");
+        })
+        .filter(Boolean)
+        .join("\n\n");
+    body = body.trim();
+}
+
+// =====================================================
+// webゲンロン / シラス
+// =====================================================
+if (link.includes("https://shirasu.io/c/genron")) {
+
+    const lines = body.replace(/\r\n/g, "\n").split("\n");
+    let inFence = false;
+    let fenceMarker = "";
+    body = lines.map(line => {
+        // fenced code block 开始 / 结束
+        const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+        if (fenceMatch) {
+            const marker = fenceMatch[1][0];
+            if (!inFence) {
+                inFence = true;
+                fenceMarker = marker;
+            } else if (marker === fenceMarker) {
+                inFence = false;
+                fenceMarker = "";
+            }
+            return line;
+        }
+        // fenced code block 内不处理
+        if (inFence) {
+            return line;
+        }
+        // 保留 Markdown 标题行开头的 #
+        const headingMatch = line.match(/^(\s{0,3})(#{1,6})([ \t]+.*)$/);
+        let headingPrefix = "";
+        let rest = line;
+        if (headingMatch) {
+            headingPrefix = headingMatch[1] + headingMatch[2];
+            rest = headingMatch[3];
+        }
+        const protectedParts = [];
+        const protect = value => {
+            const token = `\uE000${protectedParts.length}\uE001`;
+            protectedParts.push(value);
+            return token;
+        };
+        // 1. 先保护整个 HTML 标签
+        // 必须放在 URL 保护之前
+        rest = rest.replace(
+            /<[^>]+>/g,
+            match => protect(match)
+        );
+        // 2. 保护行内代码
+        rest = rest.replace(
+            /(`+)([\s\S]*?)\1/g,
+            match => protect(match)
+        );
+        // 3. 保护 Markdown 图片与链接中的目标地址
+        rest = rest.replace(
+            /(!?\[[^\]]*\]\()([^)]+)(\))/g,
+            (match, open, url, close) =>
+                open + protect(url) + close
+        );
+        // 4. 保护尖括号形式的 URL
+        rest = rest.replace(
+            /<https?:\/\/[^>]+>/g,
+            match => protect(match)
+        );
+        // 5. 保护裸 URL
+        rest = rest.replace(
+            /https?:\/\/[^\s<>()]+/g,
+            match => protect(match)
+        );
+        // 其余 # 转为全角
+        rest = rest.replace(/#/g, "＃");
+        // 还原受保护内容
+        rest = rest.replace(
+            /\uE000(\d+)\uE001/g,
+            (_, index) => protectedParts[Number(index)]
+        );
+        return headingPrefix + rest;
+    }).join("\n");
+}
+
+
+ // ======================================
+ // GLOBAL：删除失效本地图片及关联说明
+ // ======================================
+const imageExt = /\.(png|jpe?g|gif|webp|svg|bmp|avif|heic|tiff?)$/i;
+const captionPattern = /写真はイメージ|Shutterstock|Getty Images/i;
+let removedImages = 0;
+const lines = body.split(/\r?\n/);
+const captionLinesToRemove = new Set();
+body = lines.map((line, index) => {
+    let removed = false;
+    const cleaned = line.replace(
+    /\[!\[\[([^\]\r\n]+)\]\]\]\(https?:\/\/[^)\r\n]+\)|!\[\[([^\]\r\n]+)\]\]|!\[[^\]\r\n]*\]\((<[^>\r\n]+>|[^)\r\n]+)\)/g,
+    (match, wrappedWiki, wiki, md) => {
+            const wikiPath = wrappedWiki || wiki;
+            let path = wikiPath
+            ? wikiPath.split("|")[0].split("#")[0].trim()
+            : md.trim().replace(/^<|>$/g, "").split(/[?#]/)[0];
+            if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(path))
+                return match;
+            if (!imageExt.test(path))
+                return match;
+            try {
+                path = decodeURIComponent(path);
+            } catch (e) {
+                return match;
+            }
+            const resolved =
+                app.metadataCache.getFirstLinkpathDest(path, file.path) ||
+                app.vault.getAbstractFileByPath(path.replace(/^\//, ""));
+            if (resolved) return match;
+            removedImages++;
+            removed = true;
+            return "";
+        }
+    );
+    // 图片失效：检查原始位置的下2行
+    if (removed) {
+        for (let offset = 1; offset <= 2; offset++) {
+            const nextIndex = index + offset;
+            if (
+                nextIndex < lines.length &&
+                captionPattern.test(lines[nextIndex])
+            ) {
+                captionLinesToRemove.add(nextIndex);
+            }
+        }
+    }
+	 // 图片删除后整行为空：删除该行
+	 // 如果紧接的下一行也是空行，则一起删除
+	if (removed && cleaned.trim() === "") {
+	    if (
+	        index + 1 < lines.length &&
+	        lines[index + 1].trim() === ""
+	    ) {
+	        captionLinesToRemove.add(index + 1);
+	    }
+	    return null;
+	}
+    return cleaned;
+
+}).filter((line, index) =>
+    line !== null && !captionLinesToRemove.has(index)
+).join("\n");
+
+
+// ======================================
+// 写回文件
+// ======================================
+if (frontmatter + body !== content) {
+    await app.vault.modify(file, frontmatter + body);
+}
+// 调试时可查看清理数量
+if (removedImages > 0) {
+    console.log(
+        "Removed missing images:",
+        removedImages,
+        file.path
+    );
+}
+%>
