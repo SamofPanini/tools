@@ -108,6 +108,7 @@ if (link.includes("https://forbesjapan.com/")) {
     // 清除标注页数的内容 (如: [PAGE 2](https://forbesjapan.com/articles/detail/99240/page2))
     body = body.replace(/^\s*\[PAGE [1-9]\]\([^)]+\)\s*\n?/gm, "");
     body = body.replace(/.*次ページ.*\r?\n?/gu,"");
+    body = body.replace(/広告\r?\n?/gu,"");
     body = body.replace(/Measure[\s\S]*$/u,"");
     body = body.replace(
     /^[ \t]*\* \* \*[ \t]*\r?\n[ \t]*\r?\n[ \t]*page:[ \t]*\[\d+\]\(https?:\/\/[^)\r\n]+\)[ \t]*(?:\r?\n|$)/gmu,
@@ -652,7 +653,7 @@ if (link.includes("https://shirasu.io/c/genron")) {
  // GLOBAL：删除失效本地图片及关联说明
  // ======================================
 const imageExt = /\.(png|jpe?g|gif|webp|svg|bmp|avif|heic|tiff?)$/i;
-const captionPattern = /写真はイメージ|Shutterstock|Getty Images/i;
+const captionPattern = /イメージ|Shutterstock|Getty Images|Photo|Image|credits|写真|画像|©/i;
 let removedImages = 0;
 const lines = body.split(/\r?\n/);
 const captionLinesToRemove = new Set();
