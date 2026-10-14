@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X近推文多模式采集
 // @namespace    local.x.latest3
-// @version      1.2.0
+// @version      1.2.1
 // @description  手动启动；1/3/5条独立名单；暗色紧凑界面；按账号只显示新增推文；可调5标签页并发；复制Markdown。
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -187,7 +187,7 @@
     if (!document.body || document.getElementById('tm-latest3-root')) return;
     const host = document.createElement('div');
     host.id = 'tm-latest3-root';
-    host.style.cssText = `position:fixed;right:16px;bottom:18px;z-index:2147483647;font:13px/1.5 system-ui,-apple-system,sans-serif;color:#e7e9ea;--panel-width:${PANEL_WIDTH_PX}px;`;
+    host.style.cssText = `position:fixed;right:16px;top:18px;z-index:2147483647;font:13px/1.5 system-ui,-apple-system,sans-serif;color:#e7e9ea;--panel-width:${PANEL_WIDTH_PX}px;`;
     const shadow = host.attachShadow({mode: 'open'});
     shadow.innerHTML = `
       <style>
@@ -197,9 +197,10 @@
         button:hover:not(:disabled){background:#293440}
         button:disabled{opacity:.5;cursor:default}
         .toggle{background:#172c3c;color:#fff;border:1px solid #365c77;box-shadow:0 4px 16px #0008;font-weight:700}
-        .panel{display:none;width:min(var(--panel-width),calc(100vw - 24px));max-height:82dvh;overflow-y:auto;margin-bottom:9px;background:#10171d;border:1px solid #35414a;border-radius:12px;box-shadow:0 8px 30px #0009;padding:14px;color:#e7e9ea;color-scheme:dark}
+        .panel{display:none;width:min(var(--panel-width),calc(100vw - 24px));max-height:82dvh;overflow-y:auto;margin-top:9px;background:#10171d;border:1px solid #35414a;border-radius:12px;box-shadow:0 8px 30px #0009;padding:14px;color:#e7e9ea;color-scheme:dark}
         .panel.open{display:block}
-        .heading{font-size:15px;font-weight:750;margin-bottom:9px}
+        .heading{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:15px;font-weight:750;margin-bottom:9px}
+        .minimize{padding:0;min-width:29px;height:26px;border-radius:7px;line-height:1;font-size:19px;font-weight:500}
         .mode-tabs,.account-tabs,.actions,.settings{display:flex;gap:7px;align-items:center}
         .mode-tabs{margin:0 0 10px}
         .mode-tabs button{flex:1;min-width:0;padding:7px 5px}
@@ -225,8 +226,9 @@
         .empty{color:#8e9ca7;font-size:12px;margin:8px 0}
         @media(max-width:440px){.panel{padding:11px}.settings{gap:8px}.setting{gap:4px}.setting label{font-size:12px}.setting input{width:49px}.mode-tabs button{font-size:12px}.actions button{padding:6px 8px}}
       </style>
+      <button class="toggle" id="toggle" type="button" aria-expanded="false" aria-controls="panel">X 推文采集</button>
       <div class="panel" id="panel">
-        <div class="heading">X 指定账号 · 最近推文</div>
+        <div class="heading"><span>X 指定账号 · 最近推文</span><button id="minimize" class="minimize" type="button" aria-label="缩小面板" title="缩小面板">−</button></div>
         <div class="mode-tabs">
           <button id="tab-single" class="selected" type="button">最新 1 条</button>
           <button id="tab-triple" type="button">最新 3 条</button>
@@ -258,8 +260,7 @@
         <div class="account-tabs" id="account-tabs"></div>
         <div class="empty" id="empty">抓取后点击账号名查看新增推文。</div>
         <textarea id="output" class="output" rows="9" readonly placeholder="这里仅显示所选账号的新增推文"></textarea>
-      </div>
-      <button class="toggle" id="toggle" type="button">X 推文采集</button>`;
+      </div>`;
     document.body.appendChild(host);
 
     const $ = id => shadow.getElementById(id);
@@ -290,7 +291,12 @@
       $('concurrency').value = value;
       GM_setValue('latest3:concurrency', value);
     });
-    $('toggle').onclick = () => $('panel').classList.toggle('open');
+    function setPanelOpen(open) {
+      $('panel').classList.toggle('open', open);
+      $('toggle').setAttribute('aria-expanded', String(open));
+    }
+    $('toggle').onclick = () => setPanelOpen(!$('panel').classList.contains('open'));
+    $('minimize').onclick = () => setPanelOpen(false);
 
     function buildAllMarkdown(session) {
       return `# X 最近推文 · 增量采集\n\n${session.usernames.filter(u => session.data.has(u))
